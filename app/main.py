@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .config import settings
 from .database import init_db
 from .routers import vendor, token, admin
 
@@ -30,7 +31,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Берём из настроек, а не хардкодом: раньше CORS_ORIGINS в конфиге был,
+    # но игнорировался, и сузить его без правки кода было нельзя.
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

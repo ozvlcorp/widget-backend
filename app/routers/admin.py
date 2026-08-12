@@ -24,7 +24,11 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 
 
 def _check_secret(x_admin_secret: Optional[str] = Header(default=None)):
-    if settings.admin_secret and x_admin_secret != settings.admin_secret:
+    # Пустой ADMIN_SECRET раньше СНИМАЛ проверку — ручки, меняющие app_secret
+    # любого виджета, оказывались открыты всему интернету. Теперь пусто = выключено.
+    if not settings.admin_secret:
+        raise HTTPException(503, "ADMIN_SECRET is not configured — admin endpoints are disabled")
+    if x_admin_secret != settings.admin_secret:
         raise HTTPException(403, "Forbidden")
 
 

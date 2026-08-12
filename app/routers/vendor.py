@@ -8,15 +8,19 @@ MoySklad calls:
   PUT    /{widget_name}/api/moysklad/vendor/1.0/apps/{appId}/{accountId}
   DELETE /{widget_name}/api/moysklad/vendor/1.0/apps/{appId}/{accountId}
 """
+import hashlib
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from pydantic import BaseModel
 from typing import Optional
 
 from ..database import get_db
 from ..models import AppToken, ContextSession
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["MoySklad Vendor API"])
 
 
@@ -77,6 +81,24 @@ async def activate(
     return {"status": "Activated"}
 
 
+@router.get("/{widget_name}/api/moysklad/vendor/1.0/apps/{app_id}/{account_id}")
+async def app_status(
+    widget_name: str,
+    app_id: str,
+    account_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Статус приложения в аккаунте. МойСклад опрашивает его при установке —
+    без обработчика ручка отвечала 405, и установка вставала."""
+    result = await db.execute(
+        select(AppToken).where(
+            AppToken.widget_name == widget_name,
+            AppToken.account_id == account_id,
+        ).limit(1)
+    )
+    return {"status": "Activated" if result.scalar_one_or_none() else "Deactivated"}
+
+
 @router.delete("/{widget_name}/api/moysklad/vendor/1.0/apps/{app_id}/{account_id}")
 async def deactivate(
     widget_name: str,
@@ -91,6 +113,14 @@ async def deactivate(
             AppToken.account_name == body.accountName,
         )
     )
+    # Заодно выбрасываем контексты аккаунта: без этого висящий contextKey
+    # продолжал бы менять себя на уже удалённый токен.
+    await db.execute(
+        delete(ContextSession).where(
+            ContextSession.widget_name == widget_name,
+            ContextSession.account_name == body.accountName,
+        )
+    )
     await db.commit()
     return {"status": "Deactivated"}
 
@@ -103,11 +133,10 @@ async def register_context_key(
     db: AsyncSession = Depends(get_db),
 ):
     """MoySklad calls this to register a contextKey before loading the iframe."""
-    import logging
-    logger = logging.getLogger(__name__)
+    # Сам ключ в лог не пишем — это учётные данные; хватит отпечатка.
     logger.info(
-        "Context registration: widget='%s' contextKey='%s' account='%s'",
-        widget_name, context_key, body.accountName,
+        "Context registered: widget='%s' contextKey=%s",
+        widget_name, hashlib.sha256(context_key.encode()).hexdigest()[:8],
     )
     existing = await db.get(ContextSession, context_key)
     if existing:

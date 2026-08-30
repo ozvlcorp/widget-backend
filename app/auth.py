@@ -46,6 +46,9 @@ async def caller_account(
         select(AppToken).where(
             AppToken.widget_name == widget_name,
             AppToken.access_token == token,
+            # Приостановленная установка хранит пустой токен и статус != active:
+            # её данные читать больше нельзя, пока решение не возобновят.
+            AppToken.status == "active",
         ).limit(1)
     )
     row = result.scalar_one_or_none()

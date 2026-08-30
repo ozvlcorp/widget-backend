@@ -36,3 +36,18 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS ix_app_tokens_access_token "
             "ON app_tokens (access_token)"
         ))
+        # Жизненный цикл установки. Раньше приостановка и удаление сносили строку,
+        # теперь она остаётся со статусом — существующим записям проставляем active.
+        await conn.execute(text(
+            "ALTER TABLE app_tokens ADD COLUMN IF NOT EXISTS "
+            "status VARCHAR NOT NULL DEFAULT 'active'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE app_tokens ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE app_tokens ADD COLUMN IF NOT EXISTS deactivation_cause VARCHAR"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_app_tokens_status ON app_tokens (status)"
+        ))

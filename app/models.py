@@ -29,8 +29,21 @@ class AppToken(Base):
     widget_name = Column(String, primary_key=True)
     account_name = Column(String, primary_key=True)
     app_uid = Column(String, nullable=False)
-    access_token = Column(String, nullable=False)
+    # Пустая строка после Suspend/Uninstall: МойСклад аннулирует токен в момент
+    # деактивации, держать мёртвые учётные данные незачем.
+    access_token = Column(String, nullable=False, default="")
     account_id = Column(String, nullable=True, index=True)  # MoySklad account UUID
+
+    # active | suspended | uninstalled.
+    #
+    # Строку не удаляем ни при приостановке, ни при удалении: документация Vendor
+    # API требует сохранять конфигурацию установки при Suspend и рекомендует
+    # сохранять её при Uninstall, чтобы пользователю не пришлось настраивать
+    # решение заново после переустановки.
+    status = Column(String, nullable=False, default="active", index=True)
+    deactivated_at = Column(DateTime, nullable=True)
+    deactivation_cause = Column(String, nullable=True)
+
     installed_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

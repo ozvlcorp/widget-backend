@@ -7,11 +7,27 @@ Descriptor endpointBase for each widget:
 MoySklad calls:
   PUT    /{widget_name}/api/moysklad/vendor/1.0/apps/{appId}/{accountId}
   DELETE /{widget_name}/api/moysklad/vendor/1.0/apps/{appId}/{accountId}
+
+Жизненный цикл установки описан в Vendor API 1.0, раздел «Деактивация решения
+на аккаунте». Существенное для этого файла:
+
+  * Приостановка и удаление приходят ОДНИМ И ТЕМ ЖЕ DELETE, различаются полем
+    cause (Suspend / Uninstall), и обрабатывать их требуется по-разному:
+    при Suspend настройки и конфигурацию установки удалять нельзя, при
+    Uninstall их рекомендуется сохранить для переустановки.
+  * Оба запроса должны быть идемпотентными — МойСклад их повторяет и дублирует.
+  * При активации с cause=Resume нужно вернуть Activated, если решение может
+    продолжить работу с ранее сохранёнными настройками.
+  * Для cause=TariffChanged и Autoprolongation блок access НЕ ПРИХОДИТ.
+    Отвечать на это ошибкой нельзя: 4xx переводит решение в ActivationFailed.
+  * Токен аннулируется МоимСкладом в момент деактивации — на нашей стороне он
+    после этого бесполезен, поэтому очищаем его, а не храним мёртвым.
 """
 import hashlib
 import logging
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, select
 from pydantic import BaseModel
@@ -23,6 +39,14 @@ from ..models import AppToken, ContextSession
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["MoySklad Vendor API"])
 
+# Причины деактивации из документации Vendor API.
+CAUSE_SUSPEND = "Suspend"
+CAUSE_UNINSTALL = "Uninstall"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 class AccessItem(BaseModel):
     resource: str
@@ -33,15 +57,17 @@ class AccessItem(BaseModel):
 class ActivationRequest(BaseModel):
     appUid: str
     accountName: str
-    access: list[AccessItem]
-    cause: str
+    # Отсутствует при TariffChanged и Autoprolongation — там менять нечего,
+    # приходит только описание подписки.
+    access: Optional[list[AccessItem]] = None
+    cause: Optional[str] = None
     subscription: Optional[dict] = None
 
 
 class DeactivationRequest(BaseModel):
-    appUid: str
+    appUid: Optional[str] = None
     accountName: str
-    cause: str
+    cause: Optional[str] = None
 
 
 class ContextKeyRequest(BaseModel):
@@ -58,16 +84,24 @@ async def activate(
     body: ActivationRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    if not body.access:
-        raise HTTPException(400, "No access token provided")
-
-    access_token = body.access[0].access_token
+    access_token = body.access[0].access_token if body.access else None
     existing = await db.get(AppToken, (widget_name, body.accountName))
 
+    if access_token is None and existing is None:
+        # Нечего активировать и нечем: без токена и без прошлой установки
+        # решение работать не сможет.
+        raise HTTPException(400, "No access token provided")
+
     if existing:
-        existing.access_token = access_token
+        # Смена тарифа и автопродление приходят без access — прошлый токен
+        # остаётся действующим, перетирать его на None нельзя.
+        if access_token:
+            existing.access_token = access_token
         existing.app_uid = body.appUid
         existing.account_id = account_id
+        existing.status = "active"
+        existing.deactivated_at = None
+        existing.deactivation_cause = None
     else:
         db.add(AppToken(
             widget_name=widget_name,
@@ -75,9 +109,18 @@ async def activate(
             app_uid=body.appUid,
             access_token=access_token,
             account_id=account_id,
+            status="active",
         ))
 
     await db.commit()
+
+    logger.info(
+        "Активация: widget='%s' account='%s' cause=%s",
+        widget_name, body.accountName, body.cause,
+    )
+    # Настроек, которые пользователь обязан задать руками, у решения нет:
+    # дашборд работает сразу после установки. Поэтому SettingsRequired не
+    # возвращаем ни при Install, ни при Resume.
     return {"status": "Activated"}
 
 
@@ -94,6 +137,7 @@ async def app_status(
         select(AppToken).where(
             AppToken.widget_name == widget_name,
             AppToken.account_id == account_id,
+            AppToken.status == "active",
         ).limit(1)
     )
     return {"status": "Activated" if result.scalar_one_or_none() else "Deactivated"}
@@ -107,14 +151,23 @@ async def deactivate(
     body: DeactivationRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    await db.execute(
-        delete(AppToken).where(
-            AppToken.widget_name == widget_name,
-            AppToken.account_name == body.accountName,
-        )
-    )
-    # Заодно выбрасываем контексты аккаунта: без этого висящий contextKey
-    # продолжал бы менять себя на уже удалённый токен.
+    cause = body.cause or CAUSE_UNINSTALL
+    install = await db.get(AppToken, (widget_name, body.accountName))
+
+    # Идемпотентность: МойСклад повторяет и дублирует эти запросы. 204 — «нечего
+    # отключать», и повтор уже обработанного удаления сюда же и попадает.
+    if install is None or install.status != "active":
+        return Response(status_code=204)
+
+    install.status = "suspended" if cause == CAUSE_SUSPEND else "uninstalled"
+    install.deactivated_at = _utcnow()
+    install.deactivation_cause = cause
+    # МойСклад аннулировал токен ещё до этого запроса — хранить его нет смысла,
+    # а как учётные данные он лежать не должен.
+    install.access_token = ""
+
+    # Контексты живут минуты и без токена бесполезны — выбрасываем в обоих
+    # случаях, к «конфигурации установки» они не относятся.
     await db.execute(
         delete(ContextSession).where(
             ContextSession.widget_name == widget_name,
@@ -122,7 +175,13 @@ async def deactivate(
         )
     )
     await db.commit()
-    return {"status": "Deactivated"}
+
+    logger.info(
+        "Деактивация: widget='%s' account='%s' cause=%s — строка установки сохранена",
+        widget_name, body.accountName, cause,
+    )
+    # Тело ответа по документации пустое.
+    return Response(status_code=200)
 
 
 @router.put("/{widget_name}/api/moysklad/vendor/1.0/context/{context_key}")

@@ -65,13 +65,17 @@ async def trigger_sync_one(
         select(AppToken).where(
             AppToken.widget_name == widget_name,
             AppToken.account_id == account_id,
+            AppToken.status == "active",
         ).limit(1)
     )
     row = result.scalar_one_or_none()
     if row is None:
         raise HTTPException(404, "Account not installed for this widget")
 
-    _spawn(sync_account(account_id, widget_name, row.access_token, trigger="manual"))
+    _spawn(sync_account(
+        account_id, widget_name, row.access_token,
+        account_name=row.account_name, trigger="manual",
+    ))
     return {"status": "started", "widget": widget_name, "account_id": account_id}
 
 

@@ -51,6 +51,7 @@ from .models import (
 )
 from .moysklad import (
     MoyskladClient,
+    MoyskladError,
     entity_id_from_href,
     ms_datetime,
     parse_ms_datetime,
@@ -655,6 +656,7 @@ async def sync_account(
     widget_name: str,
     access_token: str,
     *,
+    account_name: str,
     trigger: str = "cron",
 ) -> dict[str, Any]:
     """Один полный прогон по аккаунту. Возвращает статистику записанных строк."""
@@ -702,6 +704,32 @@ async def sync_account(
                 await db.commit()
         return stats
 
+    except MoyskladError as exc:
+        if exc.status in (401, 403):
+            # Токен аннулирован: решение удалили или приостановили, а колбэк
+            # деактивации до нас не дошёл (или пришёл и был потерян). Гасим
+            # установку, иначе воркер будет ломиться в неё каждую ночь вечно.
+            logger.warning(
+                "Аккаунт %s: токен отвергнут (%s) — помечаю установку неактивной",
+                account_id, exc.status,
+            )
+            async with AsyncSessionLocal() as db:
+                install = await db.get(AppToken, (widget_name, account_name))
+                if install and install.status == "active":
+                    install.status = "token_revoked"
+                    install.deactivated_at = _utcnow()
+                    install.deactivation_cause = f"HTTP {exc.status} от МойСклад"
+                    install.access_token = ""
+                saved = await db.get(SyncRun, run.id)
+                if saved:
+                    saved.status = "failed"
+                    saved.finished_at = _utcnow()
+                    saved.stats = stats
+                    saved.error = f"токен отвергнут: HTTP {exc.status}"
+                await db.commit()
+            return {"skipped": f"token revoked (HTTP {exc.status})"}
+        raise
+
     except Exception as exc:
         logger.exception("Синк аккаунта %s провалился", account_id)
         async with AsyncSessionLocal() as db:
@@ -727,7 +755,10 @@ async def sync_all_accounts(*, trigger: str = "cron") -> dict[str, Any]:
     процесс и база общие, и десяток параллельных заливок съест и то и другое.
     """
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(AppToken))
+        # Только действующие установки. У приостановленной и удалённой токен
+        # аннулирован МоимСкладом — ходить по ним значит гарантированно получать
+        # 401 каждую ночь.
+        result = await db.execute(select(AppToken).where(AppToken.status == "active"))
         installs = [
             (row.account_id, row.widget_name, row.access_token, row.account_name)
             for row in result.scalars()
@@ -738,7 +769,8 @@ async def sync_all_accounts(*, trigger: str = "cron") -> dict[str, Any]:
     for account_id, widget_name, token, account_name in installs:
         try:
             summary["runs"][f"{widget_name}/{account_name}"] = await sync_account(
-                account_id, widget_name, token, trigger=trigger
+                account_id, widget_name, token,
+                account_name=account_name, trigger=trigger,
             )
             summary["ok"] += 1
         except Exception as exc:

@@ -169,6 +169,7 @@ async def db_ready():
 
 async def run_sync(fake, **kw):
     sync_module._transport_override = fake.transport()
+    kw.setdefault("account_name", "jamshid")
     try:
         return await sync_module.sync_account(ACCOUNT, WIDGET, TOKEN, **kw)
     finally:
@@ -486,3 +487,173 @@ async def test_manual_sync_rejects_unknown_account(two_accounts):
         r = await c.post(f"/admin/sync/{WIDGET}/acc-does-not-exist",
                          headers={"X-Admin-Secret": "test-secret"})
     assert r.status_code == 404
+
+
+# ─── Жизненный цикл установки: Suspend / Uninstall / Resume ──────────────────
+#
+# Требования Vendor API 1.0, раздел «Деактивация решения на аккаунте»:
+# Suspend и Uninstall приходят одним DELETE и обрабатываются по-разному,
+# запросы идемпотентны, при Resume возвращаем Activated.
+
+VENDOR_PATH = f"/{WIDGET}/api/moysklad/vendor/1.0/apps/APP-ID/{ACCOUNT}"
+
+
+def _activation(cause, token=TOKEN, with_access=True):
+    body = {"appUid": "uid", "accountName": "jamshid", "cause": cause}
+    if with_access:
+        body["access"] = [{"resource": "https://api.moysklad.ru/api/remap/1.2",
+                           "scope": ["admin"], "access_token": token}]
+    return body
+
+
+async def _install_row():
+    async with AsyncSessionLocal() as db:
+        return await db.get(AppToken, (WIDGET, "jamshid"))
+
+
+@pytest.mark.asyncio
+async def test_suspend_keeps_the_install_row(db_ready):
+    async with _client() as c:
+        r = await c.request("DELETE", VENDOR_PATH,
+                            json={"accountName": "jamshid", "cause": "Suspend"})
+    assert r.status_code == 200
+    assert r.content == b"", "тело ответа по документации пустое"
+
+    row = await _install_row()
+    assert row is not None, "при Suspend конфигурацию установки удалять нельзя"
+    assert row.status == "suspended"
+    assert row.access_token == "", "аннулированный токен не храним"
+    assert row.deactivation_cause == "Suspend"
+
+
+@pytest.mark.asyncio
+async def test_uninstall_also_keeps_settings_for_reinstall(db_ready):
+    async with _client() as c:
+        r = await c.request("DELETE", VENDOR_PATH,
+                            json={"accountName": "jamshid", "cause": "Uninstall"})
+    assert r.status_code == 200
+
+    row = await _install_row()
+    assert row is not None, "данные установки рекомендуется сохранять для переустановки"
+    assert row.status == "uninstalled"
+    assert row.access_token == ""
+
+
+@pytest.mark.asyncio
+async def test_deactivation_is_idempotent(db_ready):
+    async with _client() as c:
+        first = await c.request("DELETE", VENDOR_PATH,
+                                json={"accountName": "jamshid", "cause": "Suspend"})
+        second = await c.request("DELETE", VENDOR_PATH,
+                                 json={"accountName": "jamshid", "cause": "Suspend"})
+        never = await c.request("DELETE", VENDOR_PATH,
+                                json={"accountName": "no-such-account", "cause": "Uninstall"})
+    assert first.status_code == 200
+    assert second.status_code == 204, "повтор уже обработанного удаления → 204"
+    assert never.status_code == 204, "аккаунт никогда не был установлен → 204"
+
+
+@pytest.mark.asyncio
+async def test_resume_reactivates_with_activated_status(db_ready):
+    async with _client() as c:
+        await c.request("DELETE", VENDOR_PATH,
+                        json={"accountName": "jamshid", "cause": "Suspend"})
+        r = await c.put(VENDOR_PATH, json=_activation("Resume", token="new-token"))
+
+    assert r.status_code == 200
+    assert r.json() == {"status": "Activated"}, "решение продолжает работу с сохранёнными настройками"
+
+    row = await _install_row()
+    assert row.status == "active"
+    assert row.access_token == "new-token"
+    assert row.deactivated_at is None
+
+
+@pytest.mark.asyncio
+async def test_tariff_change_without_access_block_does_not_fail(db_ready):
+    """
+    При TariffChanged и Autoprolongation блок access не приходит. Ответ 4xx
+    перевёл бы решение в ActivationFailed, то есть смена тарифа у клиента
+    ломала бы установку.
+    """
+    async with _client() as c:
+        r = await c.put(VENDOR_PATH, json=_activation("TariffChanged", with_access=False))
+
+    assert r.status_code == 200, f"смена тарифа не должна валить активацию: {r.text}"
+    assert r.json() == {"status": "Activated"}
+
+    row = await _install_row()
+    assert row.access_token == TOKEN, "прежний токен остался действующим"
+
+
+@pytest.mark.asyncio
+async def test_suspended_install_gets_no_token_and_no_data(db_ready):
+    async with _client() as c:
+        await c.put(f"/{WIDGET}/api/moysklad/vendor/1.0/context/CK-1",
+                    json={"accountName": "jamshid"})
+        await c.request("DELETE", VENDOR_PATH,
+                        json={"accountName": "jamshid", "cause": "Suspend"})
+
+        by_context = await c.get(f"/{WIDGET}/token", params={"contextKey": "CK-1"})
+        by_bearer = await c.get(f"/{WIDGET}/data/status",
+                                headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert by_context.status_code == 401
+    assert by_bearer.status_code == 401, "по приостановленной установке данные не отдаём"
+
+
+@pytest.mark.asyncio
+async def test_context_key_is_single_use(db_ready):
+    async with _client() as c:
+        await c.put(f"/{WIDGET}/api/moysklad/vendor/1.0/context/CK-2",
+                    json={"accountName": "jamshid"})
+        first = await c.get(f"/{WIDGET}/token", params={"contextKey": "CK-2"})
+        second = await c.get(f"/{WIDGET}/token", params={"contextKey": "CK-2"})
+
+    assert first.status_code == 200
+    assert first.json()["access_token"] == TOKEN
+    assert second.status_code == 401, "ключ гасится сразу после обмена"
+
+
+# ─── Синк и аннулированный токен ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sync_skips_non_active_installs(db_ready):
+    async with AsyncSessionLocal() as db:
+        row = await db.get(AppToken, (WIDGET, "jamshid"))
+        row.status = "suspended"
+        row.access_token = ""
+        await db.commit()
+
+    fake = FakeMoySklad({"demand": [make_doc("d1", TODAY)]})
+    sync_module._transport_override = fake.transport()
+    try:
+        summary = await sync_module.sync_all_accounts()
+    finally:
+        sync_module._transport_override = None
+
+    assert summary["accounts"] == 0, "приостановленную установку воркер не трогает"
+    assert await count(SyncedDocument) == 0
+
+
+@pytest.mark.asyncio
+async def test_revoked_token_disables_the_install_instead_of_failing_forever(db_ready):
+    """
+    Токен аннулируется при удалении и приостановке решения. Если колбэк
+    деактивации до нас не дошёл, синк не должен ломиться в этот аккаунт каждую
+    ночь — установку надо погасить.
+    """
+    class Revoked(FakeMoySklad):
+        def _handle(self, request):
+            return _httpx.Response(401, json={"errors": [{"error": "Unauthorized"}]})
+
+    result = await run_sync(Revoked())
+
+    assert "skipped" in result, f"401 не должен выбрасывать исключение: {result}"
+    row = await _install_row()
+    assert row.status == "token_revoked"
+    assert row.access_token == ""
+
+    # И на следующую ночь этот аккаунт уже не берётся в работу.
+    summary = await sync_module.sync_all_accounts()
+    assert summary["accounts"] == 0

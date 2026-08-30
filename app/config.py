@@ -5,6 +5,17 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@db:5432/widgets"
     cors_origins: list[str] = ["*"]
 
+    # Дополнительно к cors_origins: любой наш поддомен пускаем без перечисления.
+    #
+    # Все виджеты живут на *.oymoysklad.com, и требовать, чтобы каждый новый
+    # домен руками вписывали в CORS_ORIGINS, — это ровно тот шаг, который
+    # забывают. Забытый выглядит не как ошибка, а как «ничего не изменилось»:
+    # браузер режет запрос, фронт молча уходит на прямой путь в МойСклад.
+    #
+    # Сверка идёт по fullmatch, поэтому https://чужой.oymoysklad.com.example.com
+    # под шаблон не попадёт. Пустая строка отключает правило.
+    cors_origin_regex: str = r"https://[a-z0-9.-]+\.oymoysklad\.com"
+
     # Защита /admin/*. Пусто = админские ручки ОТКЛЮЧЕНЫ (503), а не открыты.
     # Раньше пустое значение молча снимало проверку (`if settings.admin_secret
     # and ...`), и любой мог перезаписать app_secret любого виджета.

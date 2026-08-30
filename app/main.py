@@ -39,6 +39,8 @@ app.add_middleware(
     # Берём из настроек, а не хардкодом: раньше CORS_ORIGINS в конфиге был,
     # но игнорировался, и сузить его без правки кода было нельзя.
     allow_origins=settings.cors_origins,
+    # Наши собственные поддомены разрешены всегда — см. cors_origin_regex.
+    allow_origin_regex=settings.cors_origin_regex or None,
     allow_methods=["*"],
     allow_headers=["*"],
 )

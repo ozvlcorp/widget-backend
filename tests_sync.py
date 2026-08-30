@@ -650,3 +650,47 @@ async def test_revoked_token_disables_the_install_instead_of_failing_forever(db_
     # И на следующую ночь этот аккаунт уже не берётся в работу.
     summary = await sync_module.sync_all_accounts()
     assert summary["accounts"] == 0
+
+
+# ─── Счётчик rows_synced ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_rows_synced_counts_each_document_once(db_ready):
+    """
+    Заливка идёт окнами, и на каждом окне счётчик прибавлялся заново от общего
+    накопленного значения, а не от записанного в этом окне. Итог раздувался тем
+    сильнее, чем больше окон — на данные это не влияло (upsert по первичному
+    ключу), но цифра в /admin/sync/status врала.
+    """
+    # Пять документов, разнесённых так, чтобы попасть в разные окна по 30 дней.
+    docs = [make_doc(f"d{i}", TODAY - timedelta(days=i * 40)) for i in range(5)]
+    fake = FakeMoySklad({"demand": docs})
+
+    await run_sync(fake)
+
+    stored = await count(SyncedDocument, doc_type="demand")
+    async with AsyncSessionLocal() as db:
+        state = await db.get(SyncState, (ACCOUNT, WIDGET, "doc:demand"))
+
+    assert stored == 5, "все документы в базе"
+    assert state.rows_synced == 5, (
+        f"счётчик обязан совпадать с числом документов, а не расти по окнам: "
+        f"rows_synced={state.rows_synced}, документов={stored}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_profit_rows_are_counted_too(db_ready):
+    """Посуточная прибыль писалась, но в rows_synced не попадала вовсе."""
+    fake = FakeMoySklad({"demand": [make_doc("d1", TODAY - timedelta(days=1))]})
+    day = TODAY.date().isoformat()
+    fake.profit_by_day[day] = [
+        {"assortment": {"id": "p1", "name": "Товар 1", "meta": {"type": "product"}},
+         "sellQuantity": 1, "sellSum": 10000, "sellCost": 6000},
+    ]
+
+    await run_sync(fake)
+
+    async with AsyncSessionLocal() as db:
+        state = await db.get(SyncState, (ACCOUNT, WIDGET, "profit_daily"))
+    assert state.rows_synced > 0, "прибыль по товарам должна попадать в счётчик"

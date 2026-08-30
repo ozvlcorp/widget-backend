@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .database import init_db
-from .routers import vendor, token, admin
+from .routers import vendor, token, admin, sync_admin
+from .scheduler import shutdown_scheduler, start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -13,7 +14,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
+    start_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
 
 
 app = FastAPI(
@@ -42,6 +47,7 @@ app.add_middleware(
 app.include_router(vendor.router)
 app.include_router(token.router)
 app.include_router(admin.router)
+app.include_router(sync_admin.router)
 
 
 @app.get("/health", tags=["Health"])

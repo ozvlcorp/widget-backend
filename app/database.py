@@ -19,10 +19,20 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if conn.dialect.name != "postgresql":
+            # Синтаксис ниже — постгресовый. На SQLite (тесты) create_all уже
+            # создал всё нужное, доводить нечего.
+            return
         # Add account_id column if it doesn't exist yet (safe to run on every startup)
         await conn.execute(text(
             "ALTER TABLE app_tokens ADD COLUMN IF NOT EXISTS account_id VARCHAR"
         ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_app_tokens_account_id ON app_tokens (account_id)"
+        ))
+        # Токен — то, по чему data-ручки опознают аккаунт: без индекса каждый
+        # запрос виджета читал бы таблицу целиком.
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_app_tokens_access_token "
+            "ON app_tokens (access_token)"
         ))

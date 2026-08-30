@@ -10,16 +10,9 @@ sync_account открывает несколько сессий, и каждом
 
 Запуск:  .venv/bin/python -m pytest tests_sync.py -q
 """
-import os
-import tempfile
 from datetime import datetime, timedelta
 
-_TMP = tempfile.mkdtemp(prefix="widget-backend-tests-")
-os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TMP}/test.db"
-os.environ["ADMIN_SECRET"] = "test-secret"
-os.environ["SYNC_ENABLED"] = "0"
-os.environ["SYNC_WINDOW_DAYS"] = "30"
-
+# Переменные окружения и путь к базе задаёт conftest.py — до импорта app.
 import httpx
 import pytest
 import pytest_asyncio

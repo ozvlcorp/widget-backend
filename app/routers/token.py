@@ -69,6 +69,9 @@ async def _token_for_account_id(db: AsyncSession, widget_name: str, account_id: 
         select(AppToken).where(
             AppToken.widget_name == widget_name,
             AppToken.account_id == account_id,
+            # Приостановленная и удалённая установки остаются в таблице ради
+            # сохранённой конфигурации, но токена по ним выдавать нельзя.
+            AppToken.status == "active",
         ).limit(1)
     )
     return result.scalar_one_or_none()
@@ -95,6 +98,12 @@ async def get_token(
         if session and session.widget_name == widget_name:
             if _is_fresh(session.created_at):
                 account_name = session.account_name
+                # Ключ одноразовый. Документация: «Повторное использование одного
+                # и того же contextKey не рекомендуется, так как в будущем может
+                # быть запрещено». Гасим сразу после обмена, чтобы перехваченный
+                # ключ нельзя было предъявить второй раз внутри его пяти минут.
+                await db.delete(session)
+                await db.commit()
             else:
                 # Просроченный ключ не оставляем в базе: он больше ни на что не годен.
                 await db.delete(session)
@@ -157,7 +166,7 @@ async def get_token(
         raise HTTPException(401, "Unauthorized")
 
     token = await db.get(AppToken, (widget_name, account_name))
-    if not token:
+    if not token or token.status != "active" or not token.access_token:
         raise HTTPException(401, "Unauthorized")
 
     return {"access_token": token.access_token, "account_name": account_name}

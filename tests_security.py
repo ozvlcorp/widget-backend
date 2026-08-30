@@ -41,17 +41,24 @@ with TestClient(app) as c:
     r = c.get('/interfood/token', params={'contextKey': 'CK-1'})
     ok(r.status_code == 200 and r.json().get('access_token') == 'СЕКРЕТНЫЙ-ТОКЕН', "свежий contextKey отдаёт токен")
 
+    print("\n════ одноразовость contextKey ════")
+    # CK-1 выше уже обменяли на токен. Ключ одноразовый, поэтому второй обмен
+    # обязан провалиться — и состарить эту запись для проверки TTL уже нельзя.
+    r = c.get('/interfood/token', params={'contextKey': 'CK-1'})
+    ok(r.status_code == 401, f"повторный обмен того же ключа → {r.status_code} (ждём 401)")
+
     print("\n════ срок жизни contextKey ════")
+    c.put('/interfood/api/moysklad/vendor/1.0/context/CK-TTL', json={'accountName': 'jamshid'})
     async def age_key():
         from datetime import datetime, timedelta, timezone
         async with database.AsyncSessionLocal() as db:
-            s = await db.get(ContextSession, 'CK-1')
+            s = await db.get(ContextSession, 'CK-TTL')
             s.created_at = datetime.now(timezone.utc) - timedelta(seconds=settings.context_key_ttl_seconds + 60)
             await db.commit()
     asyncio.get_event_loop().run_until_complete(age_key())
-    r = c.get('/interfood/token', params={'contextKey': 'CK-1'})
+    r = c.get('/interfood/token', params={'contextKey': 'CK-TTL'})
     ok(r.status_code == 401, f"просроченный contextKey → {r.status_code} (ждём 401)")
-    r = c.get('/interfood/token', params={'contextKey': 'CK-1'})
+    r = c.get('/interfood/token', params={'contextKey': 'CK-TTL'})
     ok(r.status_code == 401, "повторно — тоже 401 (запись удалена)")
 
     print("\n════ чужой виджет не получит токен ════")

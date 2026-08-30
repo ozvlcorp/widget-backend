@@ -304,6 +304,10 @@ async def _sync_documents_backfill(
             "expand": "agent",
         }
 
+        # Считаем записанное в этом окне отдельно: rows_synced прибавляется на
+        # каждой итерации, и накопленный за всю заливку `written` раздувал бы
+        # счётчик тем сильнее, чем больше окон.
+        window_written = 0
         batch: list[dict] = []
         async for row in client.paginate(f"/entity/{doc_type}", params, limit=100):
             values = _document_values(account_id, doc_type, row)
@@ -311,17 +315,19 @@ async def _sync_documents_backfill(
                 continue
             batch.append(values)
             if len(batch) >= 500:
-                written += await _upsert(db, SyncedDocument, batch)
+                window_written += await _upsert(db, SyncedDocument, batch)
                 batch.clear()
 
         if batch:
-            written += await _upsert(db, SyncedDocument, batch)
+            window_written += await _upsert(db, SyncedDocument, batch)
+
+        written += window_written
 
         # Курсор двигаем только после того, как окно записано целиком: иначе
         # прерванный прогон оставил бы в истории дыру и никогда к ней не вернулся.
         cursor = window_start
         state.backfill_cursor = cursor
-        state.rows_synced = (state.rows_synced or 0) + written
+        state.rows_synced = (state.rows_synced or 0) + window_written
         await db.commit()
 
     if cursor <= earliest:
@@ -509,6 +515,7 @@ async def _sync_profit_daily(
     recent_days = [today, today - timedelta(days=1)]
     for day in recent_days:
         written += await _sync_profit_for_day(db, client, account_id, day)
+    state.rows_synced = (state.rows_synced or 0) + written
     await db.commit()
 
     # 2. История назад от курсора.
@@ -531,8 +538,10 @@ async def _sync_profit_daily(
 
     while cursor > earliest_day and not deadline.expired:
         cursor -= timedelta(days=1)
-        written += await _sync_profit_for_day(db, client, account_id, cursor)
+        day_written = await _sync_profit_for_day(db, client, account_id, cursor)
+        written += day_written
         state.backfill_cursor = datetime.combine(cursor, datetime.min.time())
+        state.rows_synced = (state.rows_synced or 0) + day_written
         await db.commit()
 
     if cursor <= earliest_day:
